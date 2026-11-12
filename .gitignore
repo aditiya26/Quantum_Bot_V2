@@ -1,0 +1,15 @@
+﻿# Abaikan file environment dan database
+.env
+*.db
+*.db-wal
+*.db-shm
+quantum_state.db
+*.log
+*.zip
+backups/
+__pycache__/
+*.pyc
+isolated_state.json
+cooldown_state.json
+daily_state.json
+HALT.flag
