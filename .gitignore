@@ -1,9 +1,7 @@
-﻿# Abaikan file environment dan database
-.env
+﻿.env
 *.db
 *.db-wal
 *.db-shm
-quantum_state.db
 *.log
 *.zip
 backups/
