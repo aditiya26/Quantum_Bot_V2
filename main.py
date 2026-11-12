@@ -13,6 +13,7 @@ if sys.platform == 'win32':
 
 import config.settings as cfg
 from core.memory_guard import MemoryGuard
+from core.github_backup import run_github_backup
 from core.exness_mt5 import ExnessMT5Client
 from core.state_manager import StateManager
 from core.order_lock import OrderLockManager
@@ -66,6 +67,7 @@ class MultiExchangeBotV4:
         self._last_sync_time = 0.0
         self._last_heartbeat_time = time.time()
         self._last_gc_time = time.time()
+        self._last_github_backup = time.time()
 
     def release_all_halts(self):
         cfg.GLOBAL_HALT = False
@@ -280,6 +282,13 @@ class MultiExchangeBotV4:
                     self.memory_guard.check_and_auto_trim(data_hub=self.data_hub, mt5_client=self.client)
                     self._last_gc_time = now
                     logging.info("[SYSTEM] Garbage Collector berjalan. RAM dibersihkan.")
+
+
+                # [FITUR BARU] Auto-Backup ke GitHub setiap 6 Jam
+                if now - self._last_github_backup > 21600:
+                    logging.info("[SYSTEM] Memulai Auto-Backup ke GitHub...")
+                    asyncio.get_running_loop().run_in_executor(None, run_github_backup)
+                    self._last_github_backup = now
 
                 await self.pos_mgr.manage_all(equity=self.current_equity)
                 isolated_pairs = getattr(self.pos_mgr.isolated, 'isolated_pairs', {})
