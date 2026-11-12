@@ -1,4 +1,4 @@
-﻿import logging, time
+import logging, time
 import numpy as np
 import pandas as pd
 import config.settings as cfg

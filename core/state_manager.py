@@ -1,4 +1,4 @@
-﻿"""
+"""
 QuantumBot Pro V3.4 - High-Speed SQLite WAL Engine & In-Memory State Manager
 Fixed: Database connection churn & disk I/O bottleneck.
 """

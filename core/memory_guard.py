@@ -1,4 +1,4 @@
-﻿"""
+"""
 QuantumBot Pro V4.9 - Institutional Memory & RAM Guard
 """
 import os, sys, gc, time, ctypes, logging

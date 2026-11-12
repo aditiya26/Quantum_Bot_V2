@@ -1,4 +1,4 @@
-﻿import logging
+import logging
 import config.settings as cfg
 from engine.institutional_orchestrator import InstitutionalPreventiveShield
 from monitor.news_filter import NewsFilter

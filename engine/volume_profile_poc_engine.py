@@ -1,4 +1,4 @@
-﻿import time
+import time
 import logging
 import numpy as np
 import config.settings as cfg

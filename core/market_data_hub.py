@@ -1,4 +1,4 @@
-﻿"""
+"""
 Central Market Data Hub V3.0
 """
 import time, asyncio, numpy as np

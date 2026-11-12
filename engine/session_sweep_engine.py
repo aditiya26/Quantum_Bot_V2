@@ -1,4 +1,4 @@
-﻿import logging
+import logging
 import time
 from datetime import datetime
 import config.settings as cfg

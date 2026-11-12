@@ -194,7 +194,7 @@ class MultiExchangeBotV4:
     async def generate_all_time_engine_report(self):
         try:
             history = await self.client.fetch_history(days=30)
-            IGNORE_MAGICS = [111, 444, 777, 3007, 234000, 2003] # Grid, Pure Hedge, PA VWAP, Stat-Arb, Manual
+            IGNORE_MAGICS = [111, 2004, 111, 444, 777, 3007, 234000, 2003] # Grid, Pure Hedge, PA VWAP, Stat-Arb, Manual
             if not history:
                 return " <b>LAPORAN ENGINE</b>\n\nTidak ada data history dalam 30 hari terakhir."
 
@@ -289,6 +289,13 @@ class MultiExchangeBotV4:
                     logging.info("[SYSTEM] Memulai Auto-Backup ke GitHub...")
                     asyncio.get_running_loop().run_in_executor(None, run_github_backup)
                     self._last_github_backup = now
+
+
+                # [OPTIMASI] Sinkronisasi Cache Isolated ke exness_mt5
+                if hasattr(self.pos_mgr.isolated, 'isolated_pairs'):
+                    pairs = self.pos_mgr.isolated.isolated_pairs
+                    iso_set = set(str(k) for k in pairs.keys()) | set(str(v) for v in pairs.values())
+                    self.client._isolated_tickets_cache = iso_set
 
                 await self.pos_mgr.manage_all(equity=self.current_equity)
                 isolated_pairs = getattr(self.pos_mgr.isolated, 'isolated_pairs', {})

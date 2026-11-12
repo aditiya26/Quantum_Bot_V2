@@ -1,4 +1,4 @@
-﻿"""
+"""
 QuantumBot Pro V6.0 - Telegram Master UI & Command Hub
 Full Integration: RAM Guard, Isolated Engine, Analytics Per Engine, MT5 Sync.
 """
@@ -130,7 +130,7 @@ class TelegramNotifier:
                 ("PA VWAP", "PA_ENABLED"), ("ICT", "ICT_ENABLED"),
                 ("VWAP Trend", "VWAP_TREND_ENABLED"), ("VWAP Exp", "VWAP_TREND_EXPANSION_ENABLED"),
                 ("VW-ORB", "VW_ORB_ENABLED"), ("Squeeze", "SQUEEZE_ENABLED"),
-                ("Safe Grid", "SAFE_GRID_ENABLED"), ("Sweep", "SWEEP_ENABLED"),
+                ("Sweep", "SWEEP_ENABLED"),
                 ("VWAP Bnc", "VWAP_BOUNCE_ENABLED"), ("VWAP M5", "VWAP_MICRO_M5_ENABLED"),
                 ("Z-Score M15", "ZSCORE_ENABLED"), ("Z-Score Stat", "ZSCORE_STAT_ENABLED"),
                 ("POC", "POC_ENABLED"), ("Pivot", "PIVOT_BOUNCE_ENABLED"),
@@ -246,6 +246,8 @@ class TelegramNotifier:
                     if self.bot_instance.global_risk: self.bot_instance.global_risk.reset_emergency_halt()
                     if self.bot_instance.pos_mgr: self.bot_instance.pos_mgr.clear_all_halted_engines()
                 await self.edit_message(msg_id, " <b>MODE DARURAT DILEPAS</b>\nFile HALT.flag dihapus. Bot aktif kembali.", 'main')
+            elif data_str == 'menu_trade':
+                await self.edit_message(msg_id, ' <b>TRADE MANUAL</b>', 'trade')
             elif data_str == 'menu_pos':
                 pos = await cli.fetch_positions() if cli else []
                 if not pos:
@@ -273,7 +275,7 @@ class TelegramNotifier:
                 history = await cli.fetch_history(days=days) if cli else []
                 
                 # Filter engine lama/mati
-                IGNORE_MAGICS = [111, 444, 777, 3007, 234000, 3005, 2004]
+                IGNORE_MAGICS = [111, 2004, 111, 444, 777, 3007, 234000, 3005, 2004]
                 history = [h for h in history if h.get('magic', 0) not in IGNORE_MAGICS]
                 
                 if not history:

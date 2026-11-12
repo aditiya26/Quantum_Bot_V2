@@ -1,4 +1,4 @@
-﻿import asyncio, logging, time
+import asyncio, logging, time
 import numpy as np
 import pandas as pd
 import config.settings as cfg

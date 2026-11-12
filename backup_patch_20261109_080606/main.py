@@ -1,4 +1,4 @@
-﻿"""
+"""
 QuantumBot Pro V3.0 - High-Frequency Institutional Quant Engine (Non-Blocking Backup)
 """
 import sys, io, os, time, asyncio, logging, logging.handlers

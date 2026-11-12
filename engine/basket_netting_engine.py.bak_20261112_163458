@@ -1,0 +1,73 @@
+﻿"""
+QuantumBot Pro V5.0 - Basket Netting Engine (FASE 4)
+Menutup SEMUA posisi 1 simbol jika total PnL gabungan >= $10.
+Mekanisme "Si Penyapu Bersih": profit posisi hijau menghapus loss posisi merah.
+"""
+import logging
+import config.settings as cfg
+
+logger = logging.getLogger("BasketNettingEngine")
+
+class BasketNettingEngine:
+    MAGIC = 777777  # Magic khusus (tidak dipakai engine lain)
+
+    def __init__(self, state, clients, telegram, order_lock):
+        self.state = state
+        self.clients = clients
+        self.telegram = telegram
+        self.order_lock = order_lock
+        self.exchange = "exness_mt5"
+
+    async def manage(self):
+        if not getattr(cfg, 'BASKET_NETTING_ENABLED', True):
+            return
+        client = self.clients.get(self.exchange)
+        if not client:
+            return
+
+        mt5_pos = await client.fetch_positions()
+        if not mt5_pos:
+            return
+
+        # Group posisi per simbol
+        by_symbol = {}
+        for p in mt5_pos:
+            sym = p['symbol']
+            by_symbol.setdefault(sym, []).append(p)
+
+        target = getattr(cfg, 'SYMBOL_BASKET_PROFIT_TARGET', 10.0)
+
+        for sym, positions in by_symbol.items():
+            if not cfg.ACTIVE_SYMBOLS.get(sym, True):
+                continue
+
+            total_pnl = sum(p.get('profit', 0.0) for p in positions)
+            if total_pnl < target:
+                continue
+
+            logger.info(f"[BASKET NETTING] {sym} total=${total_pnl:.2f} >= target ${target}. Sapu bersih!")
+
+            async with self.order_lock.get(sym):
+                closed = 0
+                failed = 0
+                for p in positions:
+                    try:
+                        res = await client.close_position(sym, p['contracts'], p['side'], str(p['ticket']))
+                        if res:
+                            closed += 1
+                        else:
+                            failed += 1
+                    except Exception as e:
+                        failed += 1
+                        logger.error(f"[BASKET] Gagal close #{p['ticket']}: {e}")
+
+            if closed > 0 and self.telegram:
+                emoji = "" if total_pnl > 0 else ""
+                await self.telegram.send(
+                    f"{emoji} <b>BASKET NETTING EXECUTED</b>\n"
+                    f"Simbol: <b>{sym}</b>\n"
+                    f"Positions closed: <b>{closed}</b> (failed: {failed})\n"
+                    f"Net PnL: <b>+${total_pnl:.2f}</b>\n"
+                    f"Margin dibebaskan.",
+                    with_keyboard=False
+                )

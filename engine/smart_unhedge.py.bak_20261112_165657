@@ -1,0 +1,148 @@
+import asyncio, logging, json, os, time
+import config.settings as cfg
+import pandas as pd
+import numpy as np
+
+logger = logging.getLogger("SmartUnHedge")
+
+class SmartUnHedgeEngine:
+    def __init__(self, state, clients, telegram, order_lock):
+        self.clients = clients
+        self.telegram = telegram
+        self.order_lock = order_lock
+        self.exchange = "exness_mt5"
+        self.state_file = "isolated_state.json"
+
+    def _load_state(self):
+        if os.path.exists(self.state_file):
+            try:
+                with open(self.state_file, 'r') as f:
+                    return json.load(f).get('pairs', {})
+            except: return {}
+        return {}
+
+    def _save_state(self, pairs):
+        try:
+            with open(self.state_file, 'w') as f:
+                json.dump({'pairs': pairs}, f, indent=2)
+        except: pass
+
+    async def manage(self):
+        client = self.clients.get(self.exchange)
+        if not client: return
+        
+        isolated_pairs = self._load_state()
+        if not isolated_pairs: return
+        
+        mt5_pos = await client.fetch_positions()
+        if not mt5_pos: return
+        active_tickets = {str(p['ticket']): p for p in mt5_pos}
+        
+        for orig_ticket, hedge_tickets in list(isolated_pairs.items()):
+            if orig_ticket not in active_tickets: continue
+            
+            # Pastikan formatnya list (karena sistem split hedge)
+            if not isinstance(hedge_tickets, list):
+                hedge_tickets = [hedge_tickets]
+                
+            pos_orig = active_tickets[orig_ticket]
+            symbol = pos_orig['symbol']
+            
+            # 1. Ambil Data M15 untuk RSI
+            bars = await client.fetch_ohlcv(symbol, '15m', 40)
+            if not bars or len(bars) < 20: continue
+            
+            closes = np.array([b[4] for b in bars], dtype=float)
+            delta = np.diff(closes)
+            gain = pd.Series(np.where(delta > 0, delta, 0.0)).ewm(alpha=1/14, adjust=False).mean().iloc[-1]
+            loss = pd.Series(np.where(delta < 0, -delta, 0.0)).ewm(alpha=1/14, adjust=False).mean().iloc[-1]
+            rs = gain / (loss + 1e-9)
+            rsi = 100.0 - (100.0 / (1.0 + rs))
+
+            # 2. Logika Un-Hedge (Hanya jika RSI Ekstrem)
+            # Skenario 1: Original SELL, Hedge BUY. Harga OVERBOUGHT (RSI > 70). Harga akan turun.
+            if pos_orig['side'].upper() == 'SELL' and rsi > 70:
+                for h_ticket in list(hedge_tickets):
+                    if h_ticket in active_tickets:
+                        h_pos = active_tickets[h_ticket]
+                        if h_pos.get('profit', 0) > 0.10: # Hedge harus profit
+                            logger.info(f"[UN-HEDGE] RSI {rsi:.1f} Overbought. Menutup Hedge #{h_ticket} (Profit).")
+                            async with self.order_lock.get(symbol):
+                                await client.close_position(symbol, h_pos['contracts'], h_pos['side'], h_ticket)
+                            hedge_tickets.remove(h_ticket)
+                            
+            # Skenario 2: Original BUY, Hedge SELL. Harga OVERSOLD (RSI < 30). Harga akan naik.
+            elif pos_orig['side'].upper() == 'BUY' and rsi < 30:
+                for h_ticket in list(hedge_tickets):
+                    if h_ticket in active_tickets:
+                        h_pos = active_tickets[h_ticket]
+                        if h_pos.get('profit', 0) > 0.10:
+                            logger.info(f"[UN-HEDGE] RSI {rsi:.1f} Oversold. Menutup Hedge #{h_ticket} (Profit).")
+                            async with self.order_lock.get(symbol):
+                                await client.close_position(symbol, h_pos['contracts'], h_pos['side'], h_ticket)
+                            hedge_tickets.remove(h_ticket)
+
+            # 3. HANDOVER KE TRAILING STOP
+            if not hedge_tickets:
+
+                # [PROTECTIVE SL] Memasang SL Darurat sebelum diserahkan ke Trailing
+
+                try:
+
+                    tick = await client.exchange.fetch_ticker(symbol)
+
+                    if tick and tick.get('bid', 0) > 0:
+
+                        contract_size = cfg.get_contract_size(symbol)
+
+                        safe_lot = max(float(pos_orig['contracts']), 0.01)
+
+                        protective_dist = (15.0 / (safe_lot * contract_size)) * 1.5
+
+                        entry = float(pos_orig['entryPrice'])
+
+                        side = pos_orig['side'].upper()
+
+                        if side == 'BUY':
+
+                            cur = tick['bid']
+
+                            candidate = max(entry - protective_dist, cur - protective_dist)
+
+                            candidate = min(candidate, cur * 0.999)
+
+                            if candidate < cur:
+
+                                await client.safe_update_sl(symbol, side, safe_lot, candidate, str(orig_ticket))
+
+                        else:
+
+                            cur = tick['ask']
+
+                            candidate = min(entry + protective_dist, cur + protective_dist)
+
+                            candidate = max(candidate, cur * 1.001)
+
+                            if candidate > cur:
+
+                                await client.safe_update_sl(symbol, side, safe_lot, candidate, str(orig_ticket))
+
+                except Exception as _pe:
+
+                    logger.error(f"[PROTECTIVE SL ERR] {_pe}")
+
+                # Jika semua Hedge sudah ditutup, hapus dari memori Isolated
+                # Posisi asli sekarang menjadi NAKED dan akan otomatis dipantau oleh DynamicEscalator (Trailing Stop)
+                logger.info(f"[HANDOVER] Posisi #{orig_ticket} ({symbol}) dilepas dari Isolated. Trailing Stop mengambil alih.")
+                del isolated_pairs[orig_ticket]
+                if self.telegram:
+                    await self.telegram.send(
+                        f" <b>SMART UN-HEDGE</b> {symbol}\n"
+                        f"Hedge ditutup (Profit). Posisi #{orig_ticket} kini bebas.\n"
+                        f"Trailing Stop telah mengambil alih kendali.", 
+                        with_keyboard=False
+                    )
+            else:
+                isolated_pairs[orig_ticket] = hedge_tickets
+                
+            self._save_state(isolated_pairs)

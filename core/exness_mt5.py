@@ -27,7 +27,9 @@ class ExnessMT5Client(ExchangeBase):
         self._l3_cache = {}
         self._magic_cache = {}
         self._magic_lock = asyncio.Lock()
-        self.banned_strategies = {} 
+        self._execution_lock = asyncio.Lock()
+        self.banned_strategies = {}
+        self._isolated_tickets_cache = set() 
         self.connected = False
         
         class ExchangeMock:
@@ -177,7 +179,11 @@ class ExnessMT5Client(ExchangeBase):
         if not MT5_AVAILABLE: return []
         cache_key = f"{symbol}_{timeframe}_{limit}"
         now = time.time()
-        if len(self._ohlcv_cache) > 50: self._ohlcv_cache.clear()
+        # [FIX RAM] Hapus 10 cache tertua (LRU) alih-alih clear() brutal
+        if len(self._ohlcv_cache) > 50:
+            oldest_keys = sorted(self._ohlcv_cache.keys(), key=lambda k: self._ohlcv_cache[k]['ts'])[:10]
+            for ok in oldest_keys:
+                del self._ohlcv_cache[ok]
         ttl_map = {'1m': 5, '5m': 15, '15m': 30, '1h': 60}
         ttl = ttl_map.get(timeframe, 20)
         if cache_key in self._ohlcv_cache and (now - self._ohlcv_cache[cache_key]['ts'] < ttl):
@@ -206,7 +212,44 @@ class ExnessMT5Client(ExchangeBase):
             if si.filling_mode & 1: return mt5.ORDER_FILLING_FOK
         return mt5.ORDER_FILLING_RETURN
 
-    async def create_order(self, symbol: str, side: str, amount: float, price: float = None, magic: int = 234000, sl: float = None, tp: float = None) -> dict:
+
+    async def _create_order_internal(self, symbol: str, side: str, amount: float, price: float = None, magic: int = 234000, sl: float = None, tp: float = None) -> dict:
+        if not MT5_AVAILABLE: return None
+        
+        if not hasattr(self, '_execution_lock'): self._execution_lock = asyncio.Lock()
+        if not hasattr(self, '_last_order_time'): self._last_order_time = {}
+        
+        if self._execution_lock.locked():
+            logger.warning(f"[IRONCLAD] Ditolak: Antrean order sedang sibuk.")
+            return None
+            
+        async with self._execution_lock:
+            now = time.time()
+            # 1. Jeda 5 Detik Global
+            if magic not in [234000, 9999]:
+                if now - self._last_order_time.get(symbol, 0) < 5.0:
+                    logger.warning(f"[IRONCLAD] Ditolak: {symbol} jeda 5 detik (Anti-Overtrading).")
+                    return None
+                    
+            # 2. Fetch Real-Time (Bypass Cache)
+            positions = await self.fetch_positions(force=True)
+            self._pos_cache = positions 
+            
+            # 3. Cek Hard Cap
+            if magic not in [234000, 9999]:
+                total_lots = sum(p['contracts'] for p in positions) if positions else 0
+                if total_lots >= getattr(cfg, 'MAX_TOTAL_OPEN_LOTS', 0.50): return None
+                if len(positions) >= getattr(cfg, 'MAX_OPEN_POSITIONS', 20): return None
+                
+                active_same_dir = [p for p in positions if p['symbol'] == symbol and p['side'].upper() == side.upper()]
+                if len(active_same_dir) >= 3:
+                    logger.warning(f"[IRONCLAD] Ditolak: {symbol} {side} sudah {len(active_same_dir)} searah.")
+                    return None
+            
+            self._last_order_time[symbol] = time.time()
+            return await self._internal_create_order(symbol, side, amount, price, magic, sl, tp)
+
+    async def _internal_create_order(self, symbol: str, side: str, amount: float, price: float = None, magic: int = 234000, sl: float = None, tp: float = None) -> dict:
         if not MT5_AVAILABLE: return None
         
         # [SATPAM GLOBAL] COOLDOWN & MIN SL
@@ -233,16 +276,55 @@ class ExnessMT5Client(ExchangeBase):
                     elif sl_distance > max_dist:
                         sl = entry_price - max_dist if side.lower() == 'buy' else entry_price + max_dist
 
-        positions = await self.fetch_positions()
+        positions = await self.fetch_positions(force=True)
         total_lots = sum(p['contracts'] for p in positions) if positions else 0
+        
+        # [FITUR BARU] Dynamic Engine Quota (Max 3 per strategi, kecuali Isolated, Crash, Manual)
+        if magic not in [9999, 888, 234000]:
+            # [OPTIMASI] Gunakan Cache RAM, bukan baca File JSON
+            iso_tickets = self._isolated_tickets_cache
+                
+            # Hitung posisi aktif engine ini yang TIDAK sedang di-Isolated
+            engine_active_count = sum(1 for p in positions if p['magic'] == magic and str(p['ticket']) not in iso_tickets)
+            max_per_engine = getattr(cfg, 'MAX_ENTRY_PER_ENGINE', 3)
+            
+            if engine_active_count >= max_per_engine:
+                logger.warning(f"ORDER DITOLAK [{symbol}]: Engine {magic} sudah mencapai limit {max_per_engine} posisi aktif.")
+                return None
         if total_lots >= getattr(cfg, 'MAX_TOTAL_OPEN_LOTS', 0.50) and magic not in [9999, 888]:
             return None
             
         total_open_pos = len(positions) if positions else 0
         max_total_pos = getattr(cfg, 'MAX_OPEN_POSITIONS', 10)
-        if total_open_pos >= max_total_pos and magic != 9999:
+        if total_open_pos >= max_total_pos and magic not in [9999, 888]: # [VIP] Isolated & Crash Sniper bypass limit
             return None
 
+                # [IRONCLAD DEFENSE V1] 
+        if magic not in [234000, 9999]: # Bypass untuk Manual & Isolated
+            # 1. Global Throttle: Jeda 120 detik antar order di simbol yang sama
+            if not hasattr(self, 'global_entry_cooldowns'): self.global_entry_cooldowns = {}
+            last_entry = self.global_entry_cooldowns.get(symbol, 0)
+            if time.time() - last_entry < 120:
+                logger.warning(f"[IRONCLAD] Ditolak: {symbol} jeda 2 menit antar order (Anti-Spam).")
+                return None
+            
+            # 2. Hard Cap Posisi Searah (Maksimal 3)
+            active_same_dir = [p for p in positions if p['symbol'] == symbol and p['side'].upper() == side.upper()]
+            if len(active_same_dir) >= 3:
+                logger.warning(f"[IRONCLAD] Ditolak: {symbol} {side} sudah ada {len(active_same_dir)} posisi searah.")
+                return None
+            
+            # 3. Hard Cap Total Lot (Maksimal 0.50)
+            if total_lots >= getattr(cfg, 'MAX_TOTAL_OPEN_LOTS', 0.50):
+                logger.warning(f"[IRONCLAD] Ditolak: Total lot akun mencapai batas maksimal.")
+                return None
+                
+            # 4. Hard Cap Total Posisi (Maksimal 20)
+            if len(positions) >= getattr(cfg, 'MAX_OPEN_POSITIONS', 20):
+                logger.warning(f"[IRONCLAD] Ditolak: Total posisi akun mencapai batas maksimal.")
+                return None
+
+        # [FIX CORRELATION GUARD] Maksimal 3 posisi searah per simbol
         TREND_MAGICS = [333, 555, 222, 999]
         if magic in TREND_MAGICS and hasattr(self, 'ai_allowed') and self.ai_allowed and symbol in self.ai_allowed:
             allowed_dir = self.ai_allowed[symbol]
@@ -272,21 +354,146 @@ class ExnessMT5Client(ExchangeBase):
                 'price': tick.ask if side.lower() == 'buy' else tick.bid, 'deviation': 35, 'magic': magic,
                 'comment': f'Q3_{magic}', 'type_time': mt5.ORDER_TIME_GTC, 'type_filling': self._get_filling(symbol)
             }
-            # [FIX] SL & TP DINONAKTIFKAN OLEH USER
+            # [FIX FAILSAFE V5] Pasang SL Darurat -$15 di server MT5 (bukan di bot)
+            # Tujuan: Jika VPS mati / internet putus, SL ini yang menyelamatkan modal.
             req['sl'] = 0.0
             req['tp'] = 0.0
-            sl = 0.0
+            # Exception: Isolated (9999) sudah pakai hedge, Manual (234000) user atur sendiri
+            if magic not in [234000, 9999]:
+                try:
+                    contract_size = cfg.get_contract_size(symbol)
+                    safe_lot = max(float(vol), 0.01)
+                    failsafe_dist = 15.0 / (safe_lot * contract_size)  # jarak harga untuk rugi $15
+                    entry_px = tick.ask if side.lower() == 'buy' else tick.bid
+                    if side.lower() == 'buy':
+                        failsafe_sl = entry_px - failsafe_dist
+                    else:
+                        failsafe_sl = entry_px + failsafe_dist
+                    req['sl'] = float(round(failsafe_sl, digits))
+                    logger.info(f"[FAILSAFE] {symbol} {side} lot={vol} dist={failsafe_dist:.4f} SL={req['sl']}")
+                except Exception as _fe:
+                    logger.error(f"[FAILSAFE ERR] {symbol}: {_fe}")
             if tp and tp > 0: req['tp'] = float(round(tp, digits))
 
             res = mt5.order_send(req)
             if res and res.retcode == mt5.TRADE_RETCODE_DONE:
                 self._pos_cache = None
-                if magic not in [234000, 9999, 888]: # [VIP] Bebas aturan SL untuk Manual, Isolated, & Crash Sniper
-                    self.entry_cooldowns[f"{symbol}_{magic}"] = time.time()
+                if magic not in [234000, 9999, 888]:
+                    self.entry_cooldowns[symbol] = time.time() # Kunci seluruh simbol
+                    self.global_entry_cooldowns[symbol] = time.time()
                 return {'id': res.order, 'ticket': res.order, 'price': res.price, 'volume': res.volume, 'average': res.price}
             return None
         try: return await asyncio.wait_for(asyncio.get_running_loop().run_in_executor(self._ex, _send), timeout=6.0)
         except: return None
+
+    async def create_order(self, symbol: str, side: str, amount: float, price: float = None, magic: int = 234000, sl: float = None, tp: float = None) -> dict:
+        if not MT5_AVAILABLE: return None
+        
+        if not hasattr(self, '_execution_lock'): 
+            self._execution_lock = asyncio.Lock()
+            
+        # Jika antrean sibuk, tolak secara diam-diam (tanpa spam log)
+        if self._execution_lock.locked():
+            return None
+            
+        async with self._execution_lock:
+            # [FASE 1: CEK KUOTA DINAMIS & COOLDOWN SATPAM]
+            current_time = time.time()
+            cooldown_key = f"{symbol}_{magic}"
+            
+            if magic not in [234000, 9999, 888]:
+                if cooldown_key in self.entry_cooldowns:
+                    if current_time - self.entry_cooldowns[cooldown_key] < 300:
+                        return None
+
+            # Paksa fetch real-time di dalam lock (Anti Baca Cache Kosong)
+            positions = await self.fetch_positions(force=True)
+            total_lots = sum(p['contracts'] for p in positions) if positions else 0
+            
+            if magic not in [9999, 888, 234000]:
+                iso_tickets = getattr(self, '_isolated_tickets_cache', set())
+                engine_active_count = sum(1 for p in positions if p['magic'] == magic and str(p['ticket']) not in iso_tickets)
+                max_per_engine = getattr(cfg, 'MAX_ENTRY_PER_ENGINE', 3)
+                
+                if engine_active_count >= max_per_engine:
+                    return None
+
+            if total_lots >= getattr(cfg, 'MAX_TOTAL_OPEN_LOTS', 0.50) and magic not in [9999, 888]:
+                return None
+                
+            total_open_pos = len(positions) if positions else 0
+            if total_open_pos >= getattr(cfg, 'MAX_OPEN_POSITIONS', 20) and magic not in [9999, 888]:
+                return None
+
+            # [CORRELATION GUARD] Maksimal 3 posisi searah per simbol
+            if magic not in [9999, 888, 234000]:
+                active_same_dir = [p for p in positions if p['symbol'] == symbol and p['side'].upper() == side.upper()]
+                if len(active_same_dir) >= 3:
+                    logger.debug(f"CORRELATION GUARD [{symbol}]: Sudah ada {len(active_same_dir)} posisi {side} searah.")
+                    return None
+
+            def _send():
+                self._ensure_connection()
+                tick = mt5.symbol_info_tick(symbol)
+                if not tick or tick.ask <= 0: return None
+                
+                spread_pct = (tick.ask - tick.bid) / tick.ask * 100
+                if spread_pct > getattr(cfg, 'GLOBAL_MAX_SPREAD_PCT', 0.25): return None
+
+                si = mt5.symbol_info(symbol)
+                sym_conf = cfg.SYMBOL_CONFIGS.get(symbol, {})
+                max_allowed_lot = sym_conf.get('max_lot', 0.03)
+                safe_amount = min(amount, max_allowed_lot)
+                
+                vol = round(round(safe_amount / (si.volume_step if si else 0.01)) * (si.volume_step if si else 0.01), 2)
+                if si: vol = max(si.volume_min, min(si.volume_max, vol))
+                digits = si.digits if si else 4
+
+                req = {
+                    'action': mt5.TRADE_ACTION_DEAL, 
+                    'symbol': symbol, 
+                    'volume': vol,
+                    'type': mt5.ORDER_TYPE_BUY if side.lower() == 'buy' else mt5.ORDER_TYPE_SELL,
+                    'price': tick.ask if side.lower() == 'buy' else tick.bid, 
+                    'deviation': 35, 
+                    'magic': magic,
+                    'comment': f'QB_{magic}', 
+                    'type_time': mt5.ORDER_TIME_GTC, 
+                    'type_filling': self._get_filling(symbol)
+                }
+
+                contract_size = cfg.get_contract_size(symbol)
+                min_dist = self.get_min_stop_distance(symbol)
+                failsafe_usd = getattr(cfg, 'ISOLATED_FAILSAFE_SL_USD', 15.0)
+                
+                sl_dist_price = failsafe_usd / (vol * contract_size)
+                sl_dist_price = max(sl_dist_price, min_dist * 2.0)
+
+                if side.lower() == 'buy':
+                    calculated_emergency_sl = round(tick.ask - sl_dist_price, digits)
+                    req['sl'] = float(calculated_emergency_sl)
+                else:
+                    calculated_emergency_sl = round(tick.bid + sl_dist_price, digits)
+                    req['sl'] = float(calculated_emergency_sl)
+
+                req['tp'] = 0.0
+                if tp and tp > 0: req['tp'] = float(round(tp, digits))
+
+                res = mt5.order_send(req)
+                if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                    self._pos_cache = None
+                    if magic not in [234000, 9999, 888]:
+                        self.entry_cooldowns[cooldown_key] = time.time()
+                    return {'id': res.order, 'ticket': res.order, 'price': res.price, 'volume': res.volume, 'average': res.price}
+                else:
+                    logger.error(f"[ORDER GAGAL] {symbol} {side} Lot {vol}. Code: {res.retcode if res else 'None'}")
+                    return None
+
+            try: 
+                return await asyncio.wait_for(asyncio.get_running_loop().run_in_executor(self._ex, _send), timeout=6.0)
+            except Exception as e: 
+                logger.error(f"Order send exception {symbol}: {e}")
+                return None
 
     async def safe_update_sl(self, symbol, side, amount, new_sl_price, old_sl_id=None):
         if not MT5_AVAILABLE: return str(old_sl_id), 0.0
@@ -417,10 +624,20 @@ class ExnessMT5Client(ExchangeBase):
                 'type_time': mt5.ORDER_TIME_GTC, 'type_filling': self._get_filling(symbol)
             }
             digits = si.digits if si else 4
-            # [FIX] SL & TP DINONAKTIFKAN OLEH USER
+            # [FIX FAILSAFE V5] Pasang SL Darurat -$15 di server MT5
             req['sl'] = 0.0
             req['tp'] = 0.0
-            sl = 0.0
+            if magic not in [234000, 9999]:
+                try:
+                    contract_size = cfg.get_contract_size(symbol)
+                    safe_lot = max(float(vol), 0.01)
+                    failsafe_dist = 15.0 / (safe_lot * contract_size)
+                    # Pastikan jarak tidak lebih kecil dari batas minimal broker (stops level)
+                    min_stops = self.get_min_stop_distance(symbol)
+                    failsafe_dist = max(failsafe_dist, min_stops * 1.5)
+                    entry_px = tick.ask if side.lower() == 'buy' else tick.bid
+                    req['sl'] = float(round(entry_px - failsafe_dist if side.lower() == 'buy' else entry_px + failsafe_dist, digits))
+                except Exception: pass
             if tp and tp > 0: req['tp'] = float(round(tp, digits))
             res = mt5.order_send(req)
             if res and res.retcode == mt5.TRADE_RETCODE_DONE:

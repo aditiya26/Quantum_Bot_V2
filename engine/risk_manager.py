@@ -167,7 +167,8 @@ class RiskManager:
         drawdown_from_peak = self.peak_equity - current_eq
         is_daily_breach = (drawdown_from_peak >= Decimal(str(getattr(cfg, 'DAILY_LOSS_LIMIT_USD', 85.0))))
 
-        if False: # [FIX] Emergency Protocol DINONAKTIFKAN
+        # [FIX V5] Nyalakan kembali Emergency Protocol (Airbag Level Akun)
+        if is_hard_loss or is_daily_breach or is_margin_critical:
             self._emergency_notified = True
             reason = "Margin Level Rendah" if is_margin_critical else ("Hard Stop Terlampaui" if is_hard_loss else "Daily Drawdown Breach")
             msg = (

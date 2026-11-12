@@ -1,0 +1,104 @@
+"""
+QuantumBot Pro V5.3 - Isolated Engine (Hedge 1:1, Bebas Cooldown, SL Terkunci)
+"""
+import asyncio, logging, json, os, time
+import config.settings as cfg
+
+logger = logging.getLogger("IsolatedEngine")
+
+class IsolatedEngine:
+    MAGIC = getattr(cfg, 'ISOLATED_MAGIC', 9999)
+    STATE_FILE = "isolated_state.json"
+
+    def __init__(self, state, clients, telegram, order_lock):
+        self.state = state
+        self.clients = clients
+        self.telegram = telegram
+        self.order_lock = order_lock
+        self.exchange = "exness_mt5"
+        self.isolated_pairs = self._load_state() 
+        self.processing_lock = asyncio.Lock()
+
+    def _load_state(self) -> dict:
+        if os.path.exists(self.STATE_FILE):
+            try:
+                with open(self.STATE_FILE, 'r') as f:
+                    data = json.load(f)
+                    return data.get('pairs', {})
+            except Exception: return {}
+        return {}
+
+    def _save_state(self):
+        try:
+            with open(self.STATE_FILE, 'w') as f:
+                json.dump({'pairs': self.isolated_pairs}, f, indent=2)
+        except Exception: pass
+
+    async def manage(self):
+        if not getattr(cfg, 'ISOLATED_ENABLED', True): return
+        client = self.clients.get(self.exchange)
+        if not client: return
+
+        async with self.processing_lock:
+            mt5_pos = await client.fetch_positions(force=True)
+            if not mt5_pos: return
+            active_tickets = {str(p['ticket']): p for p in mt5_pos}
+
+            now = time.time()
+            threshold = getattr(cfg, 'ISOLATED_LOSS_THRESHOLD', -7.0)
+            max_hold_sec = getattr(cfg, 'ISOLATED_MAX_HOLD_HOURS', 24.0) * 3600
+
+            # 1. TIMEOUT 24 JAM
+            for orig_ticket, p_info in list(self.isolated_pairs.items()):
+                if now - p_info.get('time', now) >= max_hold_sec:
+                    sym = p_info.get('symbol', 'UNKNOWN')
+                    async with self.order_lock.get(sym):
+                        if orig_ticket in active_tickets:
+                            op = active_tickets[orig_ticket]
+                            await client.close_position(op['symbol'], op['contracts'], op['side'], orig_ticket)
+                        for h in p_info.get('hedges', []):
+                            if h in active_tickets:
+                                hp = active_tickets[h]
+                                await client.close_position(hp['symbol'], hp['contracts'], hp['side'], h)
+                    del self.isolated_pairs[orig_ticket]
+                    self._save_state()
+
+            # 2. PINDAI POSISI RUGI & HEDGE 1:1
+            for p in mt5_pos:
+                if p['magic'] == self.MAGIC: continue
+                ticket = str(p['ticket'])
+                if p.get('profit', 0.0) <= threshold and ticket not in self.isolated_pairs:
+                    hedge_side = 'sell' if p['side'].upper() == 'BUY' else 'buy'
+                    total_lot = round(float(p['contracts']), 2)
+                    
+                    async with self.order_lock.get(p['symbol']):
+                        o1 = await client.create_order(p['symbol'], hedge_side, total_lot, magic=self.MAGIC, sl=0.0, tp=0.0)
+
+                    if o1:
+                        self.isolated_pairs[ticket] = {
+                            'hedges': [str(o1.get('ticket'))],
+                            'time': now,
+                            'symbol': p['symbol']
+                        }
+                        self._save_state()
+                        # [PENTING] TIDAK ADA PENGHAPUSAN SL DI SINI. SL ASLI TETAP AMAN.
+
+            # 3. EVALUASI BEP (CLOSEBY)
+            target_profit = getattr(cfg, 'ISOLATED_TARGET_PROFIT', 0.01)
+            for orig_ticket, p_info in list(self.isolated_pairs.items()):
+                if orig_ticket not in active_tickets: continue
+                hedges = p_info.get('hedges', [])
+                if not all(h in active_tickets for h in hedges): continue
+
+                pos_orig = active_tickets[orig_ticket]
+                total_net = sum(active_tickets[t].get('profit', 0.0) + active_tickets[t].get('swap', 0.0) + active_tickets[t].get('commission', 0.0) for t in [orig_ticket] + hedges)
+
+                if total_net >= target_profit:
+                    async with self.order_lock.get(pos_orig['symbol']):
+                        cb = await client.close_by(pos_orig['symbol'], orig_ticket, hedges[0], magic=self.MAGIC)
+                        if not cb:
+                            await client.close_position(pos_orig['symbol'], pos_orig['contracts'], pos_orig['side'], orig_ticket)
+                            hp = active_tickets[hedges[0]]
+                            await client.close_position(hp['symbol'], hp['contracts'], hp['side'], hedges[0])
+                    del self.isolated_pairs[orig_ticket]
+                    self._save_state()

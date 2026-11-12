@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import logging, time, pandas as pd
 import config.settings as cfg
 from monitor.news_filter import NewsFilter
@@ -126,6 +126,12 @@ class NewsStraddleEngine:
                         'sell_cancelled': False, 
                         'time': time.time()
                     }
+                elif buy_o and not sell_o:
+                    await client.cancel_pending_order(buy_o['ticket'])
+                    logger.warning(f"[STRADDLE] Sell order gagal. Buy dibatalkan.")
+                elif sell_o and not buy_o:
+                    await client.cancel_pending_order(sell_o['ticket'])
+                    logger.warning(f"[STRADDLE] Buy order gagal. Sell dibatalkan.")
                     await self.telegram.send(
                         f" <b>NEWS STRADDLE PLACED ({symbol})</b>\n"
                         f"Info: {news_msg}\n"

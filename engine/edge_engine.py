@@ -1,4 +1,4 @@
-﻿import logging, time, pandas as pd, numpy as np
+import logging, time, pandas as pd, numpy as np
 import config.settings as cfg
 from monitor.news_filter import NewsFilter
 

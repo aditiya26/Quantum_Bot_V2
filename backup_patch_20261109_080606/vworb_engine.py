@@ -1,4 +1,4 @@
-﻿import logging
+import logging
 import time
 import pandas as pd
 import datetime as dt

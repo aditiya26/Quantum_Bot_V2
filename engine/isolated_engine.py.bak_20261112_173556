@@ -1,0 +1,167 @@
+import asyncio, logging, json, os, time
+import config.settings as cfg
+
+logger = logging.getLogger("IsolatedEngine")
+
+class IsolatedEngine:
+    MAGIC = getattr(cfg, 'ISOLATED_MAGIC', 9999)
+    STATE_FILE = "isolated_state.json"
+
+    def __init__(self, state, clients, telegram, order_lock):
+        self.state = state
+        self.clients = clients
+        self.telegram = telegram
+        self.order_lock = order_lock
+        self.exchange = "exness_mt5"
+        self.isolated_pairs = self._load_state() 
+        self.processing_lock = asyncio.Lock()
+        self.hedge_cooldowns = {}
+
+    def _load_state(self):
+        if os.path.exists(self.STATE_FILE):
+            try:
+                with open(self.STATE_FILE, 'r') as f:
+                    data = json.load(f)
+                    pairs = data.get('pairs', {})
+                    # Konversi format lama (string) ke format baru (list)
+                    for k, v in pairs.items():
+                        if isinstance(v, str):
+                            pairs[k] = [v]
+                    return pairs
+            except: return {}
+        return {}
+
+    async def _save_state(self):
+        async with self.order_lock.get('ISO_STATE_LOCK'):
+            try:
+                with open(self.STATE_FILE, 'w') as f:
+                    json.dump({'pairs': self.isolated_pairs}, f, indent=2)
+            except: pass
+
+    async def manage(self):
+        if not getattr(cfg, 'ISOLATED_ENABLED', True): return
+        client = self.clients.get(self.exchange)
+        if not client: return
+
+        async with self.processing_lock:
+            mt5_pos = await client.fetch_positions(force=True)
+            if not mt5_pos: return
+            active_tickets = {str(p['ticket']): p for p in mt5_pos}
+
+            # 1. Pindai posisi baru yang butuh Hedge (Murni Split Hedge)
+            threshold = getattr(cfg, 'ISOLATED_LOSS_THRESHOLD', -7.0)
+            for p in mt5_pos:
+                if p['magic'] == self.MAGIC: continue
+                ticket = str(p['ticket'])
+                profit = p.get('profit', 0.0)
+
+                if profit <= threshold and ticket not in self.isolated_pairs:
+
+                    hedge_side = 'sell' if p['side'].upper() == 'BUY' else 'buy'
+                    total_lot = round(float(p['contracts']), 2)
+                    
+                    # [IRONCLAD] Hedge 1:1 Murni
+                    lot_1 = total_lot
+                    lot_2 = 0.0
+
+                    logger.info(f"[ISOLATED TRIGGER] #{ticket} ({p['symbol']}) rugi ${profit:.2f}. Membuka 2 Hedge: {lot_1} & {lot_2} Lot...")
+                    
+                    async with self.order_lock.get(p['symbol']):
+                        o1 = await client.create_order(p['symbol'], hedge_side, lot_1, magic=self.MAGIC, sl=0.0, tp=0.0)
+                        o2 = None
+
+                    if o1 and (o2 or lot_2 < 0.01):
+                        h1_ticket = str(o1.get('ticket'))
+                        h2_ticket = str(o2.get('ticket')) if o2 else "0"
+                        await client.safe_update_sl(p['symbol'], p['side'], total_lot, 0.0, ticket)
+                        self.isolated_pairs[ticket] = [h1_ticket, h2_ticket]
+                        await self._save_state()
+                        if self.telegram:
+                            await self.telegram.send(f" <b>SPLIT HEDGE AKTIF</b> {p['symbol']} #{ticket}\nHedge 1: {lot_1} Lot\nHedge 2: {lot_2} Lot", with_keyboard=False)
+
+            # 2. Rekonsiliasi Orphan (Hapus memori jika posisi sudah tidak ada)
+            for orig_ticket, hedge_tickets in list(self.isolated_pairs.items()):
+                if orig_ticket not in active_tickets:
+                    for h_ticket in hedge_tickets:
+                        if h_ticket in active_tickets:
+                            hp = active_tickets[h_ticket]
+                            logger.warning(f"[ORPHAN] Posisi asli #{orig_ticket} mati. Menutup hedge #{h_ticket}...")
+                            async with self.order_lock.get(hp['symbol']):
+                                await client.close_position(hp['symbol'], hp['contracts'], hp['side'], h_ticket)
+                    del self.isolated_pairs[orig_ticket]
+                    await self._save_state()
+
+            # 2b. BATAS WAKTU 24 JAM
+            TIMEOUT_SECONDS = 86400
+            now_ts = time.time()
+            for orig_ticket, hedge_tickets in list(self.isolated_pairs.items()):
+                if orig_ticket not in active_tickets: continue
+                orig = active_tickets[orig_ticket]
+                pos_age = now_ts - float(orig.get('time', now_ts))
+                if pos_age > TIMEOUT_SECONDS:
+                    async with self.order_lock.get(orig['symbol']):
+                        try:
+                            for h in hedge_tickets:
+                                if h in active_tickets and h != "0":
+                                    # [FIX] Gunakan native close_by MT5
+                                    await client.close_by(orig['symbol'], orig_ticket, h)
+                                    break # Hentikan loop setelah pasangan ditutup
+                            # Jika close_by gagal, fallback ke close_position
+                            if orig_ticket in active_tickets:
+                                await client.close_position(orig['symbol'], orig['contracts'], orig['side'], orig_ticket)
+                                for h in hedge_tickets:
+                                    if h in active_tickets:
+                                        hp = active_tickets[h]
+                                        await client.close_position(hp['symbol'], hp['contracts'], hp['side'], h)
+                        except Exception as e:
+                            logger.error(f"[TIMEOUT CLOSE ERR] {e}")
+                    del self.isolated_pairs[orig_ticket]
+                    await self._save_state()
+            # 3. Evaluasi Target CloseBy (BEP + Biaya)
+            target_profit = getattr(cfg, 'ISOLATED_TARGET_PROFIT', 0.01)
+            
+            # Urutkan berdasarkan Loss terbesar (Prioritas)
+            sorted_pairs = sorted(
+                self.isolated_pairs.items(),
+                key=lambda x: active_tickets.get(x[0], {}).get('profit', 0.0)
+            )
+
+            for orig_ticket, hedge_tickets in sorted_pairs:
+                if orig_ticket not in active_tickets: continue
+                if not all(h in active_tickets for h in hedge_tickets):
+                    # Jika ada hedge yang hilang (misal kena SL manual)
+                    del self.isolated_pairs[orig_ticket]
+                    await self._save_state()
+                    continue
+
+                pos_orig = active_tickets[orig_ticket]
+                pos_h1 = active_tickets[hedge_tickets[0]]
+                pos_h2 = active_tickets[hedge_tickets[1]] if len(hedge_tickets) > 1 else None
+
+                total_basket_net = pos_orig.get('profit', 0) + pos_h1.get('profit', 0)
+                if pos_h2:
+                    total_basket_net += pos_h2.get('profit', 0)
+
+                orig_pnl = pos_orig.get('profit', 0.0)
+                is_orig_bep = orig_pnl >= 0.0
+                is_combined_bep = total_basket_net >= target_profit
+                if is_orig_bep or is_combined_bep:
+                    logger.info(f"[CLOSEBY] #{orig_ticket} & Hedge BEP (+${total_basket_net:.2f}). Menutup...")
+                    async with self.order_lock.get(pos_orig['symbol']):
+                        try:
+                            if hedge_tickets and hedge_tickets[0] != "0":
+                                # [FIX] Gunakan native close_by MT5
+                                await client.close_by(pos_orig['symbol'], orig_ticket, hedge_tickets[0])
+                            else:
+                                await client.close_position(pos_orig['symbol'], pos_orig['contracts'], pos_orig['side'], orig_ticket)
+                        except Exception as e:
+                            logger.error(f"[CLOSEBY ERROR] {e}. Fallback ke close_position.")
+                            await client.close_position(pos_orig['symbol'], pos_orig['contracts'], pos_orig['side'], orig_ticket)
+                            if hedge_tickets and hedge_tickets[0] in active_tickets:
+                                hp = active_tickets[hedge_tickets[0]]
+                                await client.close_position(hp['symbol'], hp['contracts'], hp['side'], hedge_tickets[0])
+                    
+                    del self.isolated_pairs[orig_ticket]
+                    await self._save_state()
+                    if self.telegram:
+                        await self.telegram.send(f" <b>ISOLATED CLOSEBY</b> {pos_orig['symbol']} ditutup +${total_basket_net:.2f}", with_keyboard=False)

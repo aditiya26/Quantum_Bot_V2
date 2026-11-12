@@ -1,4 +1,4 @@
-﻿import logging
+import logging
 import config.settings as cfg
 from engine.ml_predictor_engine import MLPredictorEngine
 

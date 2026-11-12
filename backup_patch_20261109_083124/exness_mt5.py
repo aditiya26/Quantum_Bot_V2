@@ -1,4 +1,4 @@
-﻿"""
+"""
 Exness MT5 Low-Latency Async Wrapper V4.0 (Forensics Edition)
 """
 import asyncio, logging, time, concurrent.futures, os

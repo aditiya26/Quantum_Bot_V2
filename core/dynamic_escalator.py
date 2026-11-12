@@ -39,7 +39,8 @@ class DynamicEscalatorV3:
 
         # 3. LOGIKA XAUUSDm: BEP DULU, LALU TRAILING KETAT
         if "XAU" in symbol:
-            profit_usd = profit_diff * lot * 100.0
+            cs = cfg.get_contract_size(symbol)
+            profit_usd = profit_diff * lot * cs
             if profit_usd < 2.0:
                 return
 

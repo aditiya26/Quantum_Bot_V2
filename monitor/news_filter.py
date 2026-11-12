@@ -1,11 +1,22 @@
-﻿import aiohttp, asyncio, logging, time, os, json
+import aiohttp, asyncio, logging, time, os, json
 from datetime import datetime, timezone
 import config.settings as cfg
 
 logger = logging.getLogger(__name__)
 
 class NewsFilter:
+    _instance = None
+
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super(NewsFilter, cls).__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
     def __init__(self, cache_file="economic_calendar_cache.json"):
+        if self._initialized:
+            return
+        self._initialized = True
         self.cache_file = cache_file
         self.high_impact_events = []
         self.last_fetch_time = 0

@@ -1,4 +1,4 @@
-﻿import aiohttp, time, html, asyncio, logging, json, os, time, zipfile, psutil
+import aiohttp, time, html, asyncio, logging, json, os, time, zipfile, psutil
 import config.settings as cfg
 
 logger = logging.getLogger(__name__)

@@ -1,4 +1,4 @@
-﻿import aiohttp, time, html, asyncio, logging, json, os, time, zipfile
+import aiohttp, time, html, asyncio, logging, json, os, time, zipfile
 try:
     import psutil
     PSUTIL_OK = True

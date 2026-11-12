@@ -1,4 +1,4 @@
-﻿import asyncio, logging, time, numpy as np, pandas as pd
+import asyncio, logging, time, numpy as np, pandas as pd
 import config.settings as cfg
 from engine.institutional_orchestrator import InstitutionalPreventiveShield, MarketRegimeRouter
 

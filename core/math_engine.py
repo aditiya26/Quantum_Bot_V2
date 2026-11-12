@@ -1,4 +1,4 @@
-﻿import math
+import math
 import numpy as np
 import pandas as pd
 from decimal import Decimal, ROUND_DOWN
